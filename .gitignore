@@ -157,6 +157,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# Project run artifacts (mlflow, lightning, checkpoints)
+runs/
+mlruns/
+lightning_logs/
+mlflow.db
+*.ckpt
+
 # Spyder project settings
 .spyderproject
 .spyproject

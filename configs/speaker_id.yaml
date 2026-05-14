@@ -1,0 +1,7 @@
+embedder:
+  model: pyannote/embedding # must match the model used in enroll_characters
+selection:
+  min_clip_seconds: 1.5
+  target_seconds_per_char: 25.0
+scoring:
+  snr_knee_db: 20.0

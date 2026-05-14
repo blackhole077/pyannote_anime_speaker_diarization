@@ -1,0 +1,4 @@
+filters:
+  - { kind: min_duration, min_seconds: 1.0 }
+  - { kind: min_rms, min_rms: 0.005 }
+  - { kind: min_snr, min_snr_db: 10.0 }

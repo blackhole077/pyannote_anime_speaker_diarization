@@ -1,0 +1,10 @@
+accelerator: gpu
+pipeline:
+  name: pyannote/speaker-diarization-3.1
+  segmentation:
+    min_duration_off: 2.25 # Anime tends to have larger pauses so we need to account for that.
+  clustering:
+    threshold: 0.75
+    min_cluster_size: 12 # Frames at embedding rate, not seconds
+postprocess:
+  export_audio: false
