@@ -14,7 +14,3 @@ Protocols:
           uri: ${ANIME_DATA_ROOT}/audio/development.lst
           annotation: ${ANIME_DATA_ROOT}/rttm/development.rttm
           annotated: ${ANIME_DATA_ROOT}/rttm/development.uem
-        test:
-          uri: ${ANIME_DATA_ROOT}/audio/test.lst
-          annotation: ${ANIME_DATA_ROOT}/rttm/test.rttm
-          annotated: ${ANIME_DATA_ROOT}/rttm/test.uem

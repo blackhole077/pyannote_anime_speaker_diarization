@@ -13,7 +13,6 @@ from core.constants import (
     ALL_RTTM,
     ALL_UEM,
     AUDIO_ROOT,
-    RESERVED_LABELS,
     RTTM_ROOT,
     SAMPLE_RATE,
 )
@@ -141,7 +140,7 @@ class AudioDataManager(metaclass=abc.ABCMeta):
     def __new__(cls, *args, **kwargs):
         with cls._lock:
             if cls not in __class__._instances:
-                if abc.ABCMeta.__abstractmethods__(cls):
+                if cls.__abstractmethods__:
                     raise TypeError(f"{cls} is abstract and cannot be instantiated.")
                 __class__._instances[cls] = super().__new__(cls)
             return __class__._instances[cls]
@@ -370,11 +369,20 @@ def convert_to_mono_and_resample(
 def convert_audacity_labels_to_rttm(
     file_path: str,
     output_file: str,
+    uri: str | None = None,
     delimiter: str = "\t",
     file_contains_header_row: bool = False,
 ) -> None:
-    """Convert an Audacity TSV label file to RTTM via :class:`RTTMEntry`."""
-    file_id: str = f"{Path(file_path).parent.name}/{Path(file_path).stem}"
+    """Convert an Audacity TSV label file (``start<TAB>end<TAB>label``) to RTTM.
+
+    Reserved labels (``ignore``/``overlap``/``unknown``) are *kept* in the RTTM so
+    the eval's :func:`core.eval.metrics.normalize_reference` can extrude their
+    spans from the scored region; dropping them here would leave those spans
+    scored. ``uri`` sets the RTTM recording id (canonical ``<show>/<episode>``);
+    when omitted it is derived from the file path for backward compatibility.
+    """
+    if uri is None:
+        uri = f"{Path(file_path).parent.name}/{Path(file_path).stem}"
     with open(file_path, "r") as _file:
         lines: List[List[str]] = [
             line.split(delimiter) for line in map(str.strip, _file) if line
@@ -385,12 +393,12 @@ def convert_audacity_labels_to_rttm(
     rows: list[RTTMEntry] = []
     for line in lines:
         label = line[-1]
-        if label in RESERVED_LABELS:
-            continue
         start = float(line[0])
         end = float(line[1])
+        if end <= start:
+            continue
         rows.append(
-            RTTMEntry(uri=file_id, start=start, duration=end - start, speaker=label)
+            RTTMEntry(uri=uri, start=start, duration=end - start, speaker=label)
         )
 
     with open(output_file, "w") as _output:
@@ -403,6 +411,8 @@ def process_wav_file(
     # Step 1: Convert WAV to mono and resample audio (and get duration)
     data, sample_rate, file_duration = read_file_and_get_duration(wav_file_path)
     output_path = Path(AUDIO_ROOT, wav_file_path.parent.name, wav_file_path.name)
+    # Canonical recording id shared by the .lst/.uem/.rttm so pyannote can join them.
+    uri = str(output_path.relative_to(AUDIO_ROOT).with_suffix(""))
     if not register_only:
         convert_to_mono_and_resample(
             data=data,
@@ -410,16 +420,82 @@ def process_wav_file(
             output_file=output_path,
             sample_rate=SAMPLE_RATE,
         )
-    # Step 2: Convert Audacity label file (TSV) to RTTM
-    rttm_output = Path(RTTM_ROOT, label_path.parent.name, f"{label_path.stem}.rttm")
+    # Step 2: Convert Audacity label file (TSV) to RTTM, keyed by the wav stem.
+    rttm_output = Path(RTTM_ROOT, wav_file_path.parent.name, f"{wav_file_path.stem}.rttm")
     rttm_output.parent.mkdir(parents=True, exist_ok=True)
-    convert_audacity_labels_to_rttm(label_path, rttm_output)
-    # Step 3: Update LST file to include new audio file
+    convert_audacity_labels_to_rttm(label_path, rttm_output, uri=uri)
+    # Step 3: Update LST/UEM/RTTM master pools to include the new file
     lst_manager = LSTManager()
     lst_manager.add_entry(output_path)
-    # Step 4: Update UEM file to include new RTTM file
     uem_manager = UEMManager()
     uem_manager.add_entry(rttm_output, file_duration)
-    # Step 5: Write the things out
-    uem_manager.write_entries()
+    rttm_manager = RTTMManager()
+    rttm_manager.ingest_file(rttm_output)
+    # Step 4: Write the master pools out
     lst_manager.write_entries()
+    uem_manager.write_entries()
+    rttm_manager.write_entries()
+
+
+def build_protocol(
+    show: str,
+    subsets: dict[str, list[str]],
+    label_suffix: str = "_labels",
+) -> dict[str, dict[str, int]]:
+    """Build pyannote protocol files for one show from its SD label TXTs.
+
+    For every episode listed in ``subsets`` (a ``{subset_name: [episode, ...]}``
+    map, e.g. ``{"train": ["S01E01"], "development": ["S01E06"]}``) this:
+
+    - reads ``<AUDIO_ROOT>/<show>/<episode><label_suffix>.txt`` plus the matching
+      ``.wav`` (for its duration), and
+    - writes a per-episode RTTM at ``<RTTM_ROOT>/<show>/<episode>.rttm`` with the
+      canonical uri ``<show>/<episode>``.
+
+    It then writes the master pools (``all_items.lst/.uem/.rttm``) covering every
+    listed episode, and one ``<subset>.lst`` / ``<subset>.uem`` / ``<subset>.rttm``
+    per non-empty subset. Returns ``{subset: {"episodes", "rttm_rows"}}``.
+    """
+    show_audio = AUDIO_ROOT / show
+    lst = LSTManager(entries=set())
+    uem = UEMManager(entries=set())
+    rttm = RTTMManager(entries=set())
+
+    uri_subsets: dict[str, set[str]] = {}
+    for name, episodes in subsets.items():
+        uris: set[str] = set()
+        for episode in episodes:
+            uri = f"{show}/{episode}"
+            wav_path = show_audio / f"{episode}.wav"
+            label_path = show_audio / f"{episode}{label_suffix}.txt"
+            if not wav_path.exists():
+                raise FileNotFoundError(f"missing audio: {wav_path}")
+            if not label_path.exists():
+                raise FileNotFoundError(f"missing labels: {label_path}")
+            duration = float(sf.info(str(wav_path)).duration)
+            per_ep_rttm = RTTM_ROOT / show / f"{episode}.rttm"
+            per_ep_rttm.parent.mkdir(parents=True, exist_ok=True)
+            convert_audacity_labels_to_rttm(label_path, per_ep_rttm, uri=uri)
+
+            lst.entries.add(LSTEntry(uri=uri))
+            uem.entries.add(UEMEntry(uri=uri, channel="NA", start=0.0, end=duration))
+            rttm.ingest_file(per_ep_rttm)
+            uris.add(uri)
+        uri_subsets[name] = uris
+
+    # Master pools cover every ingested episode.
+    lst.write_entries(ALL_LST)
+    uem.write_entries(ALL_UEM)
+    rttm.write_entries(ALL_RTTM)
+
+    # Per-subset protocol files.
+    counts: dict[str, dict[str, int]] = {}
+    for name, uris in uri_subsets.items():
+        if not uris:
+            continue
+        rttm_sub = {e for e in rttm.entries if e.uri in uris}
+        lst.write_entries(AUDIO_ROOT / f"{name}.lst", {e for e in lst.entries if e.uri in uris})
+        uem.write_entries(RTTM_ROOT / f"{name}.uem", {e for e in uem.entries if e.uri in uris})
+        rttm.write_entries(RTTM_ROOT / f"{name}.rttm", rttm_sub)
+        counts[name] = {"episodes": len(uris), "rttm_rows": len(rttm_sub)}
+    return counts

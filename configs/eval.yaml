@@ -9,9 +9,10 @@ overrides:
       margin: 0.05
 eval:
   protocol: AnimeChars.SpeakerDiarization.Default
+  protocol_config: configs/protocols/anime.yaml
   subset: development
   output_path: runs/eval/der.json
-  enrollment_dir: runs/enrollment/healing_magic
+  enrollment_dir: runs/enrollment/healing_magic_train
 
   compute_ungated: true # This determines whether we compute without accounting for minimum similarity
 

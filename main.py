@@ -38,6 +38,41 @@ def add_file(wav_file: Path, label_file: Path, register_only: bool = False) -> N
 
 
 @app.command(
+    name="build_protocol",
+    help="Build pyannote protocol files (lst/uem/rttm) for a show from its SD label TXTs.",
+)
+def build_protocol_cmd(
+    show: str,
+    train: str = "",
+    development: str = "",
+    test: str = "",
+) -> None:
+    """Build master pools + per-subset protocol files for ``show``.
+
+    Each of ``--train`` / ``--development`` / ``--test`` is a comma-separated list
+    of episode stems (e.g. ``--train S01E01,S01E02``). Empty subsets are skipped.
+    """
+    from core.data.etl import build_protocol
+
+    def _parse(spec: str) -> list[str]:
+        return [e.strip() for e in spec.split(",") if e.strip()]
+
+    subsets = {
+        "train": _parse(train),
+        "development": _parse(development),
+        "test": _parse(test),
+    }
+    if not any(subsets.values()):
+        typer.echo("No episodes given; pass --train/--development/--test", err=True)
+        raise typer.Exit(1)
+
+    counts = build_protocol(show, subsets)
+    for name, c in counts.items():
+        typer.echo(f"  {name}: {c['episodes']} episode(s), {c['rttm_rows']} rttm rows")
+    typer.echo("Wrote master pools (all_items.*) and per-subset protocol files.")
+
+
+@app.command(
     name="run_diarization",
     help="Run the Speaker Diarization pipeline on an audio clip.",
 )

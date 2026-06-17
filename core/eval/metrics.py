@@ -24,7 +24,7 @@ from pyannote.metrics.identification import (
 )
 
 from core.config import load_cfg
-from core.constants import RESERVED_LABELS
+from core.constants import DATASET_ROOT, RESERVED_LABELS
 from core.speaker_diarization import load_diarization_pipeline
 from core.speaker_id.assign import UNKNOWN_LABEL_PREFIX, apply_gate, score_clusters
 from core.speaker_id.embed import load_embedding_model_for_inference
@@ -302,8 +302,26 @@ def load_eval_cfg(path: Path) -> DictConfig:
     })
 
 
+def _register_protocol(template_path: Path) -> None:
+    """Render ``${ANIME_DATA_ROOT}`` in a protocol YAML and register it.
+
+    pyannote.database does not expand environment variables in protocol paths and
+    resolves relative paths against the database YAML's own location, so we
+    substitute the dataset root into a temp copy and load that.
+    """
+    import tempfile
+
+    rendered = template_path.read_text().replace("${ANIME_DATA_ROOT}", str(DATASET_ROOT))
+    tmp = Path(tempfile.gettempdir()) / "anime_database.yml"
+    tmp.write_text(rendered)
+    registry.load_database(str(tmp))
+
+
 def run_eval(cfg: DictConfig, token: Optional[str] = None) -> dict:
     eval_cfg = cfg.eval
+    protocol_config = eval_cfg.get("protocol_config")
+    if protocol_config:
+        _register_protocol(Path(protocol_config))
     protocol = registry.get_protocol(eval_cfg.protocol, preprocessors={"audio": FileFinder()})
     pipeline = load_diarization_pipeline(cfg.diarization, token)
 
