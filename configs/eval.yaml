@@ -1,0 +1,20 @@
+include:
+  diarization: configs/speaker_diarization.yaml
+  speaker_id: configs/speaker_id.yaml
+# Overrides to facilitate tuning based on experiments
+overrides:
+  speaker_id:
+    gate:
+      sim: 0.40
+      margin: 0.05
+eval:
+  protocol: AnimeChars.SpeakerDiarization.Default
+  subset: development
+  output_path: runs/eval/der.json
+  enrollment_dir: runs/enrollment/healing_magic
+
+  compute_ungated: true # This determines whether we compute without accounting for minimum similarity
+
+  metrics:
+    collar: 0.25 # 250 milliseconds
+    skip_overlap: false

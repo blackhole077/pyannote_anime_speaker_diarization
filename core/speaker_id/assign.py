@@ -14,6 +14,17 @@ confident match:
   in absolute terms (out-of-distribution speaker).
 - ``min_margin``: reject if the gap between best and second-best is too small
   (two enrolled characters are equally close — assignment would be a coin flip).
+
+The pipeline is split into two pieces so the expensive embedding step can be
+amortized across multiple gate configurations:
+
+- :func:`score_clusters` runs the per-cluster embedding + scoring (GPU-bound,
+  gate-independent).
+- :func:`apply_gate` consumes those scores and produces a relabeled annotation
+  for a specific ``(similarity_threshold, min_margin)`` pair (pure-Python, cheap).
+
+:func:`assign_speakers` is a thin convenience wrapper that composes the two
+for callers that only need one gated assignment.
 """
 
 from collections import defaultdict
@@ -25,12 +36,18 @@ from pyannote.core.annotation import Annotation, Segment
 
 from core.constants import EPSILON
 
+UNKNOWN_LABEL_PREFIX = "unknown_"
+
+REASON_OK = "ok"
+REASON_BELOW_SIM = "below_similarity_threshold"
+REASON_BELOW_MARGIN = "below_margin"
+REASON_NO_SEGMENTS = "no_usable_segments"
+
 
 def embed_cluster(
     inference: Inference,
     wav_path: Path,
     segments: list[Segment],
-    *,
     min_segment_seconds: float = 1.0,
 ) -> np.ndarray | None:
     """Compute a single unit-norm embedding for an entire pyannote cluster.
@@ -60,68 +77,44 @@ def embed_cluster(
     return (centroid / (np.linalg.norm(centroid) + EPSILON)).astype(np.float32)
 
 
-def assign_speakers(
+def score_clusters(
     annotation: Annotation,
     wav_path: Path,
     centroids: dict[str, np.ndarray],
     inference: Inference,
-    *,
-    similarity_threshold: float = 0.40,
-    min_margin: float = 0.05,
-    unknown_label_prefix: str = "unknown_",
-) -> tuple[Annotation, dict[str, dict]]:
-    """Relabel pyannote cluster IDs in ``annotation`` with enrolled character names.
+) -> dict[str, dict]:
+    """Embed each cluster and score it against every enrolled centroid.
 
-    Each cluster is embedded by :func:`embed_cluster`, then the best and
-    second-best centroid matches are computed by cosine similarity. The
-    cluster is renamed to the best-matching character only if both gates
-    pass; otherwise it receives a generated ``unknown_<cluster_id>`` label.
+    Gate-independent: the returned scores can be fed to :func:`apply_gate`
+    multiple times with different thresholds without re-running inference.
 
-    Args:
-        annotation: pyannote ``Annotation`` whose labels are anonymous cluster
-            IDs (``SPEAKER_00`` etc.).
-        wav_path: Source audio for ``annotation``.
-        centroids: Enrolled per-character unit-norm centroids.
-        inference: A loaded pyannote embedding ``Inference`` instance. Must
-            match the embedder used to build ``centroids``; mismatched
-            embedders silently produce garbage similarities (verify upstream
-            via the enrollment manifest).
-        similarity_threshold: Reject as unknown if best-match cosine
-            similarity falls below this.
-        min_margin: Reject as unknown if (best - second-best) similarity
-            falls below this. Set to ``0`` to disable the margin gate.
-        unknown_label_prefix: Prefix used to build the fallback label.
-
-    Returns:
-        A tuple ``(relabeled_annotation, confidences)``. ``confidences`` maps
-        each original cluster ID to a dict containing best/second-best matches,
-        their similarities, the margin, the final assignment, and a ``reason``
-        code (``ok``, ``below_similarity_threshold``, ``below_margin``, or
-        ``no_usable_segments``).
+    Clusters with no usable segments are emitted with all scoring fields set
+    to ``None`` and ``reason=REASON_NO_SEGMENTS`` — :func:`apply_gate` honors
+    that flag to produce an unknown label regardless of thresholds. All other
+    clusters carry ``reason=None`` until a gate is applied.
     """
     by_cluster: dict[str, list[Segment]] = defaultdict(list)
     for segment, _, label in annotation.itertracks(yield_label=True):
         by_cluster[label].append(segment)
 
     char_names = list(centroids.keys())
-    char_matrix = np.vstack([centroids[c] for c in char_names])  # (C, D)
+    char_matrix = np.vstack([centroids[c] for c in char_names])
 
-    mapping: dict[str, str] = {}
-    confidences: dict[str, dict] = {}
+    scores: dict[str, dict] = {}
     for cluster_id, segments in by_cluster.items():
-        emb = embed_cluster(inference, wav_path, segments)  # (D,) or None
+        emb = embed_cluster(inference, wav_path, segments)
         if emb is None:
-            mapping[cluster_id] = f"{unknown_label_prefix}{cluster_id}"
-            confidences[cluster_id] = {
+            scores[cluster_id] = {
                 "best_match": None,
                 "similarity": None,
                 "second_best": None,
                 "second_best_similarity": None,
-                "assigned": mapping[cluster_id],
-                "reason": "no_usable_segments",
+                "margin": None,
+                "reason": REASON_NO_SEGMENTS,
             }
             continue
-        sims = char_matrix @ emb  # cosine sim since both unit-norm
+        # Both centroids and emb are unit-norm, so the dot product is cosine sim.
+        sims = char_matrix @ emb
         best = int(np.argmax(sims))
         best_sim = float(sims[best])
         if len(sims) > 1:
@@ -131,26 +124,69 @@ def assign_speakers(
         else:
             second_best_name = None
             second_best_sim = None
-        margin = best_sim - second_best_sim if second_best_sim is not None else float("inf")
-
-        if best_sim < similarity_threshold:
-            assigned = f"{unknown_label_prefix}{cluster_id}"
-            reason = "below_similarity_threshold"
-        elif margin < min_margin:
-            assigned = f"{unknown_label_prefix}{cluster_id}"
-            reason = "below_margin"
-        else:
-            assigned = char_names[best]
-            reason = "ok"
-        mapping[cluster_id] = assigned
-        confidences[cluster_id] = {
+        margin = (
+            best_sim - second_best_sim if second_best_sim is not None else float("inf")
+        )
+        scores[cluster_id] = {
             "best_match": char_names[best],
             "similarity": best_sim,
             "second_best": second_best_name,
             "second_best_similarity": second_best_sim,
             "margin": margin,
+            "reason": None,
+        }
+    return scores
+
+
+def apply_gate(
+    annotation: Annotation,
+    scores: dict[str, dict],
+    similarity_threshold: float,
+    min_margin: float,
+) -> tuple[Annotation, dict[str, dict]]:
+    """Resolve scored clusters to character names by applying the two gates.
+
+    Returns ``(relabeled_annotation, confidences)``. ``confidences`` maps each
+    original cluster ID to a dict containing the scoring fields plus a final
+    ``assigned`` label and ``reason`` code (one of ``REASON_*`` constants).
+    """
+    mapping: dict[str, str] = {}
+    confidences: dict[str, dict] = {}
+    for cluster_id, s in scores.items():
+        unknown = f"{UNKNOWN_LABEL_PREFIX}{cluster_id}"
+        if s["reason"] == REASON_NO_SEGMENTS:
+            assigned, reason = unknown, REASON_NO_SEGMENTS
+        elif s["similarity"] < similarity_threshold:
+            assigned, reason = unknown, REASON_BELOW_SIM
+        elif s["margin"] < min_margin:
+            assigned, reason = unknown, REASON_BELOW_MARGIN
+        else:
+            assigned, reason = s["best_match"], REASON_OK
+        mapping[cluster_id] = assigned
+        confidences[cluster_id] = {
+            "best_match": s["best_match"],
+            "similarity": s["similarity"],
+            "second_best": s["second_best"],
+            "second_best_similarity": s["second_best_similarity"],
+            "margin": s["margin"],
             "assigned": assigned,
             "reason": reason,
         }
-
     return annotation.rename_labels(mapping=mapping), confidences
+
+
+def assign_speakers(
+    annotation: Annotation,
+    wav_path: Path,
+    centroids: dict[str, np.ndarray],
+    inference: Inference,
+    similarity_threshold: float,
+    min_margin: float,
+) -> tuple[Annotation, dict[str, dict]]:
+    """Score + gate in one call. Convenience wrapper around
+    :func:`score_clusters` and :func:`apply_gate`. Use the two-step path
+    directly when you need to apply different gates to the same scoring run
+    (e.g., gated vs. ungated eval passes).
+    """
+    scores = score_clusters(annotation, wav_path, centroids, inference)
+    return apply_gate(annotation, scores, similarity_threshold, min_margin)

@@ -15,9 +15,8 @@ from pathlib import Path
 
 from pyannote.core.annotation import Segment
 
+from core.constants import RESERVED_LABELS
 from core.postprocess.audacity import audacity_to_annotation_format
-
-RESERVED_LABELS = frozenset({"overlap", "unknown", "ignore"})
 
 
 @dataclass(frozen=True)
@@ -49,7 +48,6 @@ class ClipRef:
 
 def collect_character_clips(
     pairs: list[tuple[Path, Path]],  # [(wav_path, labels_path), ...]
-    *,
     min_clip_seconds: float = 2.0,
     reserved: frozenset[str] = RESERVED_LABELS,
 ) -> dict[str, list[ClipRef]]:
@@ -74,7 +72,6 @@ def collect_character_clips(
     for wav_path, labels_path in pairs:
         ann = audacity_to_annotation_format(labels_path)
         for segment, _, label in ann.itertracks(yield_label=True):
-            # Toss ones that we want to ignore or are simply too short
             if label in reserved or segment.duration < min_clip_seconds:
                 continue
             by_char[label].append(ClipRef.from_segment(wav_path, segment))
@@ -101,7 +98,6 @@ def summarize(clips: dict[str, list[ClipRef]]) -> dict[str, dict]:
 
 def find_labeled_pairs(
     directory: Path,
-    *,
     wav_suffix: str = ".wav",
     labels_suffix: str = "_labels.txt",
 ) -> list[tuple[Path, Path]]:

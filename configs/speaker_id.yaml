@@ -5,3 +5,6 @@ selection:
   target_seconds_per_char: 25.0
 scoring:
   snr_knee_db: 20.0
+gate:
+  sim: 0.40 # Minimum best-match cosine similarity to assign a cluster to its best-matching character.
+  margin: 0.05 # Minimum gap between best and second-best similarity required to commit to the best match.

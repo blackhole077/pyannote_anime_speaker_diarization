@@ -14,12 +14,14 @@ from pathlib import Path
 
 import soundfile as sf
 import typer
-import yaml
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import OmegaConf
 
+from core.config import get_cfg
 from core.data.etl import process_wav_file
-from core.postprocess.audacity import (annotation_to_audacity_format,
-                                       audacity_to_annotation_format)
+from core.postprocess.audacity import (
+    annotation_to_audacity_format,
+    audacity_to_annotation_format,
+)
 from core.postprocess.quality import apply_filters, build_filters
 from core.speaker_diarization import load_diarization_pipeline
 
@@ -30,9 +32,9 @@ app = typer.Typer()
     name="add_file",
     help="Add a WAV file and associated label file to the audio dataset",
 )
-def add_file(wav_file: Path, label_file: Path) -> None:
+def add_file(wav_file: Path, label_file: Path, register_only: bool = False) -> None:
     """Ingest a single ``(wav, labels)`` pair into the dataset."""
-    process_wav_file(wav_file, label_file)
+    process_wav_file(wav_file, label_file, register_only)
 
 
 @app.command(
@@ -44,8 +46,8 @@ def run_speaker_diarization(
     token: str | None = None,
     output_label_path: Path | None = None,
     enrollment_dir: Path | None = None,
-    similarity_threshold: float = 0.40,
-    min_margin: float = 0.05,
+    similarity_threshold: float | None = None,
+    min_margin: float | None = None,
 ):
     """Run pyannote diarization and (optionally) resolve clusters to characters.
 
@@ -64,14 +66,8 @@ def run_speaker_diarization(
         enrollment_dir: Path to an enrollment store (produced by
             ``build_enrollment``). If omitted, labels remain anonymous cluster
             IDs.
-        similarity_threshold: Minimum best-match cosine similarity to assign a
-            cluster to its best-matching character.
-        min_margin: Minimum gap between best and second-best similarity
-            required to commit to the best match.
     """
-    sd_config_path: str = "configs/speaker_diarization.yaml"
-    with open(sd_config_path, "r", encoding="utf-8") as f:
-        cfg: DictConfig = OmegaConf.create(yaml.safe_load(f))
+    cfg = get_cfg("speaker_diarization")
     sd_pipeline = load_diarization_pipeline(cfg, token)
     diarization = sd_pipeline(str(wav_file))
     annotation = diarization.exclusive_speaker_diarization
@@ -81,6 +77,11 @@ def run_speaker_diarization(
         from core.speaker_id.embed import load_embedding_model_for_inference
         from core.speaker_id.store import load_centroids, load_manifest
 
+        sid_cfg = get_cfg("speaker_id")
+        if similarity_threshold is None:
+            similarity_threshold = sid_cfg.gate.sim
+        if min_margin is None:
+            min_margin = sid_cfg.gate.margin
         centroids = load_centroids(enrollment_dir)
         manifest = load_manifest(enrollment_dir)
         if manifest["embedder_model"] != "pyannote/embedding":
@@ -114,6 +115,7 @@ def run_speaker_diarization(
 
     if enrollment_dir is not None:
         import json
+
         confidences_path = output_label_path.with_suffix(".confidences.json")
         confidences_path.write_text(json.dumps(confidences, indent=2))
         typer.echo(f"Wrote confidences → {confidences_path}")
@@ -136,9 +138,7 @@ def run_quality_filter(
     output_file = Path(
         annotation_file.parent / f"{annotation_file.stem}_filtered"
     ).with_suffix(".txt")
-    qf_config_path: str = "configs/quality_filter.yaml"
-    with open(qf_config_path, "r", encoding="utf-8") as f:
-        cfg: DictConfig = OmegaConf.create(yaml.safe_load(f))
+    cfg = get_cfg("quality_filter")
     filter_spec = OmegaConf.to_container(cfg.filters, resolve=True)
     quality_filters = build_filters(filter_spec)
     audio, sample_rate = sf.read(wav_file, dtype="float32")
@@ -154,13 +154,47 @@ def run_quality_filter(
 
 
 @app.command(
+    name="eval_der",
+    help="Evaluate the diarization pipeline against a pyannote.database protocol.",
+)
+def eval_der(
+    config_path: Path = Path("configs/eval.yaml"),
+    token: str | None = None,
+):
+    """Run DER + per-character P/R against the configured protocol.
+
+    Resolves ``configs/eval.yaml`` (with its include/overrides composition),
+    runs the diarization pipeline over the configured subset, and writes a
+    JSON report to ``eval.output_path``.
+    """
+    from core.eval.metrics import load_eval_cfg, run_eval
+
+    cfg = load_eval_cfg(config_path)
+    report = run_eval(cfg, token=token)
+    der_value = report["gated"]["metrics"]["der"]["value"]
+    typer.echo(f"DER (gated): {der_value:.4f}")
+    if report["gated"]["metrics"].get("per_character"):
+        typer.echo("Per-character (gated):")
+        for char, vals in report["gated"]["metrics"]["per_character"].items():
+            typer.echo(
+                f"  {char:20s}  P={vals['precision']:.3f}  R={vals['recall']:.3f}  "
+                f"support={vals['support_seconds']:.1f}s"
+            )
+    if report.get("gate_cost"):
+        agg = report["gate_cost"]["aggregate"]
+        typer.echo(
+            f"Gate cost: DER Δ={agg['der_delta']:+.4f}  "
+            f"gate_value={agg['gate_value']:+.2f}s"
+        )
+
+
+@app.command(
     name="build_enrollment",
     help="Build a per-character speaker embedding store from labeled episodes.",
 )
 def build_enrollment(
     labeled_dir: Path,
     output_dir: Path,
-    config_path: Path = Path("configs/speaker_id.yaml"),
     show: str | None = None,
 ):
     """Build a per-character embedding store from labeled episodes.
@@ -175,22 +209,24 @@ def build_enrollment(
             ``<stem>_labels.txt`` pairs.
         output_dir: Destination for ``centroids.npz``, ``per_clip.npz``, and
             ``manifest.json``.
-        config_path: YAML config controlling embedder, selection, and scoring
-            parameters.
         show: Optional show name written to the manifest; defaults to
             ``labeled_dir.name`` if not provided.
     """
     from datetime import datetime, timezone
 
-    from core.speaker_id.embed import (enroll_characters,
-                                       load_embedding_model_for_inference)
-    from core.speaker_id.refs import (collect_character_clips,
-                                      find_labeled_pairs, summarize)
+    from core.speaker_id.embed import (
+        enroll_characters,
+        load_embedding_model_for_inference,
+    )
+    from core.speaker_id.refs import (
+        collect_character_clips,
+        find_labeled_pairs,
+        summarize,
+    )
     from core.speaker_id.select import select_enrollment_clips
     from core.speaker_id.store import save_enrollment
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        cfg = OmegaConf.create(yaml.safe_load(f))
+    cfg = get_cfg("speaker_id")
 
     pairs = find_labeled_pairs(labeled_dir)
     if not pairs:
@@ -212,7 +248,6 @@ def build_enrollment(
     inference = load_embedding_model_for_inference()
     centroids, per_clip = enroll_characters(selected, inference=inference)
 
-    # Manifest
     selected_summary = summarize(selected)
     target = cfg.selection.target_seconds_per_char
     pairs_by_stem = {l.stem.removesuffix("_labels"): l for _, l in pairs}

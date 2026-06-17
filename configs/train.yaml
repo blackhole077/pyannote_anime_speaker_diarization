@@ -1,0 +1,22 @@
+data:
+  database: /data/voice_activity_detection_dataset/anime_vad.yml
+  protocol: AnimeChars.SpeakerDiarization.Default
+
+checkpoint:
+  save_top_k: 1
+  every_n_epochs: 1
+  save_last: False
+  save_weights_only: False
+  verbose: False
+
+early_stopping:
+  min_delta: 0.0
+  patience: 10
+  strict: True
+  verbose: False
+
+trainer:
+  accelerator: gpu
+  max_epochs: 50
+  gradient_clip_val: 0.5
+  log_every_n_steps: 1

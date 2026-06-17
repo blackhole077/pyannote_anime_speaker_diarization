@@ -1,0 +1,7 @@
+loggers:
+  - type: pytorch_lightning_mlflow
+    experiment_name: anime_vad
+    run_name: run_001
+    tracking_uri: http://localhost:5000
+  - type: python
+    name: vad_logger
